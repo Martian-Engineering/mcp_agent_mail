@@ -228,6 +228,15 @@ signing-*.pub
 .codex/
 .cursor/
 .gemini/
+.beads/
+
+# IDE/Editor MCP configs (local to each developer)
+.vscode/
+cline.mcp.json
+opencode.json
+windsurf.mcp.json
+codex.mcp.json
+.gitattributes
 
 # Backup files
 *.backup
