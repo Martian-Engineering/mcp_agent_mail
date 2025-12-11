@@ -688,6 +688,7 @@ def _parse_json_safely(text: str) -> dict[str, Any] | None:
 def _parse_iso(raw_value: Optional[str]) -> Optional[datetime]:
     """Parse ISO-8601 timestamps, accepting a trailing 'Z' as UTC.
 
+    Returns a timezone-naive datetime (assumes UTC) for PostgreSQL compatibility.
     Returns None when parsing fails.
     """
     if raw_value is None:
@@ -698,7 +699,14 @@ def _parse_iso(raw_value: Optional[str]) -> Optional[datetime]:
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
+        # Convert to naive datetime for PostgreSQL compatibility
+        # (TIMESTAMP WITHOUT TIME ZONE columns require naive datetimes)
+        if dt.tzinfo is not None:
+            # Convert to UTC then strip timezone
+            from datetime import timezone
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
     except ValueError:
         return None
 
@@ -735,7 +743,13 @@ def _validate_iso_timestamp(raw_value: Optional[str], param_name: str = "timesta
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
+        # Convert to naive datetime for PostgreSQL compatibility
+        # (TIMESTAMP WITHOUT TIME ZONE columns require naive datetimes)
+        if dt.tzinfo is not None:
+            from datetime import timezone
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
     except ValueError:
         raise ToolExecutionError(
             error_type="INVALID_TIMESTAMP",
