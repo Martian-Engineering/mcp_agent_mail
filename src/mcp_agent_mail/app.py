@@ -49,6 +49,7 @@ from .models import (
     Message,
     MessageRecipient,
     Project,
+    ProjectHumanKeyAlias,
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
@@ -1314,18 +1315,34 @@ async def _ensure_project(human_key: str, git_remote_url: Optional[str] = None) 
 
     If git_remote_url is provided, slug is derived from the normalized remote URL,
     enabling multiple developers on different machines to share the same project.
+    In this mode, the human_key is also stored as an alias so future lookups
+    without git_remote_url will resolve correctly.
     """
     await ensure_schema()
     slug = _compute_project_slug(human_key, git_remote_url=git_remote_url)
     async with get_session() as session:
         result = await session.execute(select(Project).where(Project.slug == slug))  # type: ignore[arg-type]
         project = result.scalars().first()
-        if project:
-            return project
-        project = Project(slug=slug, human_key=human_key)
-        session.add(project)
-        await session.commit()
-        await session.refresh(project)  # type: ignore[arg-type]
+        if not project:
+            project = Project(slug=slug, human_key=human_key)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)  # type: ignore[arg-type]
+
+        # If git_remote_url was provided, store human_key as an alias for this project.
+        # This enables multi-developer scenarios where each dev has a different local path.
+        if git_remote_url and project.id is not None:
+            # Check if alias already exists (idempotent)
+            alias_exists = await session.execute(
+                select(ProjectHumanKeyAlias).where(
+                    ProjectHumanKeyAlias.human_key == human_key  # type: ignore[arg-type]
+                )
+            )
+            if not alias_exists.scalars().first():
+                alias = ProjectHumanKeyAlias(project_id=project.id, human_key=human_key)
+                session.add(alias)
+                await session.commit()
+
         return project
 
     # -- Identity inspection resource is registered inside build_mcp_server below
@@ -1385,12 +1402,14 @@ async def _list_project_agents(project: Project, limit: int = 10) -> list[str]:
 async def _get_project_by_identifier(identifier: str) -> Project:
     """Get project by identifier with helpful error messages and suggestions.
 
-    Looks up projects by:
+    Looks up projects by (in order):
     1. Slug (derived from identifier via slugify)
-    2. Exact human_key match (for paths like /Users/foo/Projects/bar)
+    2. Exact human_key match on Project table
+    3. Human key alias lookup (for multi-developer scenarios)
 
-    This is important for git-remote-required mode where slugs are derived from
-    git remote URLs but callers may pass the local path as project_key.
+    The alias lookup is key for git-remote-required mode where different developers
+    have different local paths to the same repository. Each developer's path is
+    stored as an alias pointing to the shared project.
     """
     await ensure_schema()
 
@@ -1411,9 +1430,19 @@ async def _get_project_by_identifier(identifier: str) -> Project:
         if project:
             return project
 
-        # Try exact human_key match (important for git-remote-required mode)
+        # Try exact human_key match on Project table
         result = await session.execute(select(Project).where(Project.human_key == identifier))  # type: ignore[arg-type]
         project = result.scalars().first()
+        if project:
+            return project
+
+        # Try human_key alias lookup (multi-developer support)
+        alias_result = await session.execute(
+            select(Project)
+            .join(ProjectHumanKeyAlias, ProjectHumanKeyAlias.project_id == Project.id)  # type: ignore[arg-type]
+            .where(ProjectHumanKeyAlias.human_key == identifier)  # type: ignore[arg-type]
+        )
+        project = alias_result.scalars().first()
         if project:
             return project
 

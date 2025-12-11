@@ -130,6 +130,28 @@ class AgentLink(SQLModel, table=True):
     expires_ts: Optional[datetime] = None
 
 
+class ProjectHumanKeyAlias(SQLModel, table=True):
+    """Maps local filesystem paths (human_keys) to projects.
+
+    In multi-developer scenarios with git-remote-required mode, different developers
+    have different local paths to the same repository. This table stores each
+    developer's path as an alias, allowing project lookup without requiring
+    git_remote_url on every call.
+
+    Example:
+    - Dev1: /Users/dev1/projects/repo → project_id=5
+    - Dev2: /Users/dev2/code/repo → project_id=5 (same project)
+    """
+
+    __tablename__ = "project_human_key_aliases"
+    __table_args__ = (UniqueConstraint("human_key", name="uq_human_key_alias"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    human_key: str = Field(max_length=512, index=True)
+    created_at: datetime = Field(default_factory=_utcnow_naive)
+
+
 class ProjectSiblingSuggestion(SQLModel, table=True):
     """LLM-ranked sibling project suggestion (undirected pair)."""
 
