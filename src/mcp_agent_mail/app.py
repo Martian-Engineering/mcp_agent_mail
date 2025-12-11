@@ -1053,7 +1053,7 @@ def _compute_project_slug(human_key: str, git_remote_url: Optional[str] = None) 
     return slugify(human_key)
 
 
-def _resolve_project_identity(human_key: str) -> dict[str, Any]:
+def _resolve_project_identity(human_key: str, git_remote_url: Optional[str] = None) -> dict[str, Any]:
     """
     Resolve identity details for a given human_key path.
     Returns: { slug, identity_mode_used, canonical_path, human_key,
@@ -1061,6 +1061,9 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
                core_ignorecase, normalized_remote, project_uid }
     Writes a private marker under .git/agent-mail/project-id when WORKTREES_ENABLED=1
     and no marker exists yet.
+
+    If git_remote_url is provided, it will be passed to _compute_project_slug to derive
+    the slug from the remote URL (for hosted deployments).
     """
     settings_local = get_settings()
     mode_config = (settings_local.project_identity_mode or "dir").strip().lower()
@@ -1264,7 +1267,7 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
         except Exception:
             pass
 
-    slug_value = _compute_project_slug(target_path)
+    slug_value = _compute_project_slug(target_path, git_remote_url=git_remote_url)
     payload = {
         "slug": slug_value,
         "identity_mode_used": mode_used,
@@ -3188,7 +3191,7 @@ def build_mcp_server() -> FastMCP:
         project = await _ensure_project(human_key, git_remote_url=remote_url)
         await ensure_archive(settings, project.slug)
         # Compose identity metadata similar to resource://identity
-        ident = _resolve_project_identity(human_key)
+        ident = _resolve_project_identity(human_key, git_remote_url=remote_url)
         payload = _project_to_dict(project)
         payload.update(ident)
         # Include git_remote_url in response if provided
