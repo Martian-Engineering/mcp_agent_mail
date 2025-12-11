@@ -52,6 +52,7 @@ from .models import (
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
+    _utcnow_naive,
 )
 from .storage import (
     ProjectArchive,
@@ -178,7 +179,7 @@ def _enforce_capabilities(ctx: Context, required: set[str], tool_name: str) -> N
 
 
 def _record_recent(tool_name: str, project: Optional[str], agent: Optional[str]) -> None:
-    RECENT_TOOL_USAGE.append((datetime.now(timezone.utc), tool_name, project, agent))
+    RECENT_TOOL_USAGE.append((_utcnow_naive(), tool_name, project, agent))
 
 
 def _instrument_tool(
@@ -1382,7 +1383,15 @@ async def _list_project_agents(project: Project, limit: int = 10) -> list[str]:
 
 
 async def _get_project_by_identifier(identifier: str) -> Project:
-    """Get project by identifier with helpful error messages and suggestions."""
+    """Get project by identifier with helpful error messages and suggestions.
+
+    Looks up projects by:
+    1. Slug (derived from identifier via slugify)
+    2. Exact human_key match (for paths like /Users/foo/Projects/bar)
+
+    This is important for git-remote-required mode where slugs are derived from
+    git remote URLs but callers may pass the local path as project_key.
+    """
     await ensure_schema()
 
     # Validate input
@@ -1396,7 +1405,14 @@ async def _get_project_by_identifier(identifier: str) -> Project:
 
     slug = slugify(identifier)
     async with get_session() as session:
+        # Try slug match first
         result = await session.execute(select(Project).where(Project.slug == slug))  # type: ignore[arg-type]
+        project = result.scalars().first()
+        if project:
+            return project
+
+        # Try exact human_key match (important for git-remote-required mode)
+        result = await session.execute(select(Project).where(Project.human_key == identifier))  # type: ignore[arg-type]
         project = result.scalars().first()
         if project:
             return project
@@ -1725,7 +1741,7 @@ async def refresh_project_sibling_suggestions(*, max_pairs: int = _PROJECT_SIBLI
             pair = _canonical_project_pair(suggestion.project_a_id, suggestion.project_b_id)
             existing_map[pair] = suggestion
 
-        now = datetime.now(timezone.utc)
+        now = _utcnow_naive()
         to_evaluate: list[tuple[Project, Project, ProjectSiblingSuggestion | None]] = []
         for idx, project_a in enumerate(projects):
             if project_a.id is None:
@@ -1885,7 +1901,7 @@ async def update_project_sibling_status(project_id: int, other_id: int, status: 
             session.add(suggestion)
             await session.flush()
 
-        now = datetime.now(timezone.utc)
+        now = _utcnow_naive()
         suggestion.status = normalized_status
         suggestion.evaluated_ts = now
         if normalized_status == "confirmed":
@@ -2056,7 +2072,7 @@ async def _get_or_create_agent(
             agent.program = program
             agent.model = model
             agent.task_description = task_description
-            agent.last_active_ts = datetime.now(timezone.utc)  # type: ignore[arg-type]
+            agent.last_active_ts = _utcnow_naive()  # type: ignore[arg-type]
             session.add(agent)
             await session.commit()
             await session.refresh(agent)
@@ -2177,7 +2193,7 @@ async def _create_message(
         for recipient, kind in recipients:
             entry = MessageRecipient(message_id=message.id, agent_id=recipient.id, kind=kind)
             session.add(entry)
-        sender.last_active_ts = datetime.now(timezone.utc)
+        sender.last_active_ts = _utcnow_naive()
         session.add(sender)
         await session.commit()
         await session.refresh(message)
@@ -2194,7 +2210,7 @@ async def _create_file_reservation(
 ) -> FileReservation:
     if project.id is None or agent.id is None:
         raise ValueError("Project and agent must have ids before creating file_reservations.")
-    expires = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+    expires = _utcnow_naive() + timedelta(seconds=ttl_seconds)
     await ensure_schema()
     async with get_session() as session:
         file_reservation = FileReservation(
@@ -2220,7 +2236,7 @@ async def _collect_file_reservation_statuses(
     if project.id is None:
         return []
     await ensure_schema()
-    moment = now or datetime.now(timezone.utc)
+    moment = now or _utcnow_naive()
     settings = get_settings()
     inactivity_seconds = max(0, int(settings.file_reservation_inactivity_seconds))
     activity_grace = max(0, int(settings.file_reservation_activity_grace_seconds))
@@ -2350,7 +2366,7 @@ async def _collect_file_reservation_statuses(
 
 async def _expire_stale_file_reservations(project_id: int) -> list[FileReservationStatus]:
     await ensure_schema()
-    now = datetime.now(timezone.utc)
+    now = _utcnow_naive()
 
     project: Optional[Project] = None
     async with get_session() as session:
@@ -2812,7 +2828,7 @@ async def _update_recipient_timestamp(
 ) -> Optional[datetime]:
     if agent.id is None:
         raise ValueError("Agent must have an id before updating message state.")
-    now = datetime.now(timezone.utc)
+    now = _utcnow_naive()
     async with get_session() as session:
         # Read current value first
         result_sel = await session.execute(
@@ -2911,7 +2927,7 @@ def build_mcp_server() -> FastMCP:
             # Server-side file_reservations enforcement: block if conflicting active exclusive file_reservation exists
             if settings.file_reservations_enforcement_enabled:
                 await _expire_stale_file_reservations(project.id or 0)
-                now_ts = datetime.now(timezone.utc)
+                now_ts = _utcnow_naive()
                 y_dir = now_ts.strftime("%Y")
                 m_dir = now_ts.strftime("%m")
                 candidate_surfaces: list[str] = []
@@ -3294,21 +3310,28 @@ def build_mcp_server() -> FastMCP:
         _validate_program_model(program, model)
         # Normalize git_remote_url
         remote_url = git_remote_url.strip() if git_remote_url else None
-        # Check if git-remote-required mode and git_remote_url not provided
         mode = (settings.project_identity_mode or "dir").strip().lower()
-        if mode == "git-remote-required" and not remote_url:
-            raise ToolExecutionError(
-                "MISSING_REQUIRED_PARAMETER",
-                "This Agent Mail server is configured with PROJECT_IDENTITY_MODE=git-remote-required. "
-                "You must provide the git_remote_url parameter. "
-                "Run 'git remote get-url origin' in your local repo and pass the result.",
-                recoverable=True,
-            )
         # If git_remote_url provided, ensure project with correct slug first
         if remote_url:
             project = await _ensure_project(project_key, git_remote_url=remote_url)
         else:
-            project = await _get_project_by_identifier(project_key)
+            # Try to look up existing project by identifier (slug or human_key)
+            # This allows using register_agent without git_remote_url if the project
+            # was previously created with ensure_project and already has the correct slug
+            try:
+                project = await _get_project_by_identifier(project_key)
+            except ToolExecutionError as e:
+                # If project not found AND git-remote-required mode, give helpful error
+                if e.error_type == "NOT_FOUND" and mode == "git-remote-required":
+                    raise ToolExecutionError(
+                        "MISSING_REQUIRED_PARAMETER",
+                        "This Agent Mail server is configured with PROJECT_IDENTITY_MODE=git-remote-required. "
+                        "You must provide the git_remote_url parameter when creating new projects. "
+                        "Run 'git remote get-url origin' in your local repo and pass the result. "
+                        "If you previously created this project, check the project_key spelling.",
+                        recoverable=True,
+                    )
+                raise
         if settings.tools_log_enabled:
             try:
                 import importlib as _imp
@@ -3733,7 +3756,7 @@ def build_mcp_server() -> FastMCP:
                     pass
             # allow recent overlapping file_reservations contact (shared surfaces) by default
             # best-effort: if both agents hold any file_reservation currently active, auto allow
-            now_utc = datetime.now(timezone.utc)
+            now_utc = _utcnow_naive()
             try:
                 async with get_session() as s2:
                     file_reservation_rows = await s2.execute(
@@ -4699,7 +4722,8 @@ def build_mcp_server() -> FastMCP:
             await ctx.info(
                 f"[warn] ttl_seconds={ttl_seconds} is below minimum (60s); auto-correcting to 60 seconds."
             )
-        now = datetime.now(timezone.utc)
+        # Use naive datetimes for PostgreSQL TIMESTAMP WITHOUT TIME ZONE columns
+        now = _utcnow_naive()
         exp = now + timedelta(seconds=max(60, ttl_seconds))
         async with get_session() as s:
             # upsert link
@@ -4781,7 +4805,8 @@ def build_mcp_server() -> FastMCP:
             await ctx.info(
                 f"[warn] ttl_seconds={ttl_seconds} is below minimum (60s); auto-correcting to 60 seconds."
             )
-        now = datetime.now(timezone.utc)
+        # Use naive datetimes for PostgreSQL TIMESTAMP WITHOUT TIME ZONE columns
+        now = _utcnow_naive()
         exp = now + timedelta(seconds=max(60, ttl_seconds)) if accept else None
         updated = 0
         async with get_session() as s:
@@ -5137,17 +5162,27 @@ def build_mcp_server() -> FastMCP:
         settings = get_settings()
         # Normalize git_remote_url
         remote_url = git_remote_url.strip() if git_remote_url else None
-        # Check if git-remote-required mode and git_remote_url not provided
         mode = (settings.project_identity_mode or "dir").strip().lower()
-        if mode == "git-remote-required" and not remote_url:
-            raise ToolExecutionError(
-                "MISSING_REQUIRED_PARAMETER",
-                "This Agent Mail server is configured with PROJECT_IDENTITY_MODE=git-remote-required. "
-                "You must provide the git_remote_url parameter. "
-                "Run 'git remote get-url origin' in your local repo and pass the result.",
-                recoverable=True,
-            )
-        project = await _ensure_project(human_key, git_remote_url=remote_url)
+        # If git_remote_url provided, ensure project with correct slug
+        if remote_url:
+            project = await _ensure_project(human_key, git_remote_url=remote_url)
+        else:
+            # Try to look up existing project by identifier (slug or human_key)
+            # This allows re-joining a session without git_remote_url if project already exists
+            try:
+                project = await _get_project_by_identifier(human_key)
+            except ToolExecutionError as e:
+                # If project not found AND git-remote-required mode, give helpful error
+                if e.error_type == "NOT_FOUND" and mode == "git-remote-required":
+                    raise ToolExecutionError(
+                        "MISSING_REQUIRED_PARAMETER",
+                        "This Agent Mail server is configured with PROJECT_IDENTITY_MODE=git-remote-required. "
+                        "You must provide the git_remote_url parameter when creating new projects. "
+                        "Run 'git remote get-url origin' in your local repo and pass the result. "
+                        "If you previously created this project, check the human_key spelling.",
+                        recoverable=True,
+                    )
+                raise
         agent = await _get_or_create_agent(project, agent_name, program, model, task_description, settings)
 
         file_reservations_result: Optional[dict[str, Any]] = None
@@ -5907,7 +5942,7 @@ def build_mcp_server() -> FastMCP:
                 .where(
                     cast(Any, FileReservation.project_id) == project_id,
                     cast(Any, FileReservation.released_ts).is_(None),
-                    cast(Any, FileReservation.expires_ts) > datetime.now(timezone.utc),
+                    cast(Any, FileReservation.expires_ts) > _utcnow_naive(),
                 )
             )
             existing_reservations = existing_rows.all()
@@ -6039,7 +6074,7 @@ def build_mcp_server() -> FastMCP:
             if project.id is None or agent.id is None:
                 raise ValueError("Project and agent must have ids before releasing file_reservations.")
             await ensure_schema()
-            now = datetime.now(timezone.utc)
+            now = _utcnow_naive()
             async with get_session() as session:
                 stmt = (
                     update(FileReservation)
@@ -6148,7 +6183,7 @@ def build_mcp_server() -> FastMCP:
                 },
             )
 
-        now = datetime.now(timezone.utc)
+        now = _utcnow_naive()
         async with get_session() as session:
             await session.execute(
                 update(FileReservation)
@@ -6291,7 +6326,7 @@ def build_mcp_server() -> FastMCP:
         if project.id is None or agent.id is None:
             raise ValueError("Project and agent must have ids before renewing file_reservations.")
         await ensure_schema()
-        now = datetime.now(timezone.utc)
+        now = _utcnow_naive()
         bump = max(60, int(extend_seconds))
 
         async with get_session() as session:
@@ -6412,7 +6447,7 @@ def build_mcp_server() -> FastMCP:
             """
             project = await _get_project_by_identifier(project_key)
             archive = await ensure_archive(settings, project.slug)
-            now = datetime.now(timezone.utc)
+            now = _utcnow_naive()
             slot_path = _slot_dir(archive, slot)
             await asyncio.to_thread(slot_path.mkdir, parents=True, exist_ok=True)
             active = _read_active_slots(slot_path, now)
@@ -6456,7 +6491,7 @@ def build_mcp_server() -> FastMCP:
             """
             project = await _get_project_by_identifier(project_key)
             archive = await ensure_archive(settings, project.slug)
-            now = datetime.now(timezone.utc)
+            now = _utcnow_naive()
             slot_path = _slot_dir(archive, slot)
             branch = _compute_branch(project.human_key)
             holder_id = _safe_component(f"{agent_name}__{branch or 'unknown'}")
@@ -6484,7 +6519,7 @@ def build_mcp_server() -> FastMCP:
             """
             project = await _get_project_by_identifier(project_key)
             archive = await ensure_archive(settings, project.slug)
-            now = datetime.now(timezone.utc)
+            now = _utcnow_naive()
             slot_path = _slot_dir(archive, slot)
             branch = _compute_branch(project.human_key)
             holder_id = _safe_component(f"{agent_name}__{branch or 'unknown'}")
@@ -7236,7 +7271,7 @@ def build_mcp_server() -> FastMCP:
         ]
 
         return {
-            "generated_at": _iso(datetime.now(timezone.utc)),
+            "generated_at": _iso(_utcnow_naive()),
             "metrics_uri": "resource://tooling/metrics",
             "clusters": clusters,
             "playbooks": playbooks,
@@ -7250,7 +7285,7 @@ def build_mcp_server() -> FastMCP:
         parameters and accepted aliases to guide clients.
         """
         return {
-            "generated_at": _iso(datetime.now(timezone.utc)),
+            "generated_at": _iso(_utcnow_naive()),
             "tools": {
                 "send_message": {
                     "required": ["project_key", "sender_name", "to", "subject", "body_md"],
@@ -7278,7 +7313,7 @@ def build_mcp_server() -> FastMCP:
     def tooling_metrics_resource() -> dict[str, Any]:
         """Expose aggregated tool call/error counts for analysis."""
         return {
-            "generated_at": _iso(datetime.now(timezone.utc)),
+            "generated_at": _iso(_utcnow_naive()),
             "tools": _tool_metrics_snapshot(),
         }
 
@@ -7304,7 +7339,7 @@ def build_mcp_server() -> FastMCP:
                 pass
         caps = _capabilities_for(agent, project)
         return {
-            "generated_at": _iso(datetime.now(timezone.utc)),
+            "generated_at": _iso(_utcnow_naive()),
             "agent": agent,
             "project": project,
             "capabilities": caps,
@@ -7331,7 +7366,7 @@ def build_mcp_server() -> FastMCP:
             win = int(window_seconds)
         except Exception:
             win = 60
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, win))
+        cutoff = _utcnow_naive() - timedelta(seconds=max(1, win))
         entries: list[dict[str, Any]] = []
         for ts, tool_name, proj, ag in list(RECENT_TOOL_USAGE):
             if ts < cutoff:
@@ -7350,7 +7385,7 @@ def build_mcp_server() -> FastMCP:
             }
             entries.append(record)
         return {
-            "generated_at": _iso(datetime.now(timezone.utc)),
+            "generated_at": _iso(_utcnow_naive()),
             "window_seconds": win,
             "count": len(entries),
             "entries": entries,
@@ -8054,7 +8089,7 @@ def build_mcp_server() -> FastMCP:
             raise ValueError("Project/agent IDs must exist")
         await ensure_schema()
         ttl = int(ttl_seconds) if ttl_seconds is not None else get_settings().ack_ttl_seconds
-        now = datetime.now(timezone.utc)
+        now = _utcnow_naive()
         out: list[dict[str, Any]] = []
         async with get_session() as session:
             rows = await session.execute(
@@ -8136,7 +8171,7 @@ def build_mcp_server() -> FastMCP:
         if project_obj.id is None or agent_obj.id is None:
             raise ValueError("Project/agent IDs must exist")
         await ensure_schema()
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, ttl_minutes))
+        cutoff = _utcnow_naive() - timedelta(minutes=max(1, ttl_minutes))
         out: list[dict[str, Any]] = []
         async with get_session() as session:
             rows = await session.execute(
