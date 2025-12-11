@@ -115,7 +115,13 @@ class Settings:
     # Global gate for worktree-friendly behavior (opt-in; default False)
     worktrees_enabled: bool
     # Identity preferences (phase 1: read-only; behavior remains 'dir' unless features enabled)
-    project_identity_mode: str  # "dir" | "git-remote" | "git-common-dir" | "git-toplevel"
+    # Modes:
+    #   - "dir": slug derived from human_key path (default)
+    #   - "git-remote": server reads git remote at human_key path (local server only)
+    #   - "git-remote-required": client must provide git_remote_url param (hosted deployments)
+    #   - "git-common-dir": slug from git common dir
+    #   - "git-toplevel": slug from git repo root
+    project_identity_mode: str
     project_identity_remote: str  # e.g., "origin"
     http: HttpSettings
     database: DatabaseSettings

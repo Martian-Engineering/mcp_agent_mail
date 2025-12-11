@@ -910,16 +910,19 @@ def _message_frontmatter(
         "attachments": attachments,
     }
 
-def _compute_project_slug(human_key: str) -> str:
+def _compute_project_slug(human_key: str, git_remote_url: Optional[str] = None) -> str:
     """
     Compute the project slug with strict backward compatibility by default.
     When worktree-friendly behavior is enabled, we still default to 'dir' mode
     until additional identity modes are implemented.
+
+    If git_remote_url is provided, it takes precedence and the slug is derived
+    from the normalized remote URL (e.g., "github.com/org/repo" -> "repo-a1b2c3d4").
+    This enables hosted deployments where multiple developers work on the same
+    repo from different local paths.
     """
     settings = get_settings()
-    # Gate: preserve existing behavior unless explicitly enabled
-    if not settings.worktrees_enabled:
-        return slugify(human_key)
+
     # Helpers for identity modes (privacy-safe)
     def _short_sha1(text: str, n: int = 10) -> str:
         return hashlib.sha1(text.encode("utf-8")).hexdigest()[:n]
@@ -952,7 +955,36 @@ def _compute_project_slug(human_key: str) -> str:
         return f"{host}/{owner}/{repo}"
 
     mode = (settings.project_identity_mode or "dir").strip().lower()
-    # Mode: git-remote
+
+    # Normalize git_remote_url (strip whitespace, treat empty as None)
+    effective_remote_url = (git_remote_url or "").strip() or None
+
+    # If git_remote_url is explicitly provided, use it regardless of mode
+    # This enables hosted deployments where clients provide their git remote
+    if effective_remote_url:
+        normalized = _norm_remote(effective_remote_url)
+        if normalized:
+            base = normalized.rsplit("/", 1)[-1] or "repo"
+            return f"{base}-{_short_sha1(normalized)}"
+        # Fall through to other modes if normalization fails
+
+    # Mode: git-remote-required - client MUST provide git_remote_url
+    # Used for hosted deployments where server cannot read client's local git repo
+    if mode == "git-remote-required":
+        raise ToolExecutionError(
+            "MISSING_REQUIRED_PARAMETER",
+            "This Agent Mail server is configured with PROJECT_IDENTITY_MODE=git-remote-required. "
+            "You must provide the git_remote_url parameter. "
+            "Run 'git remote get-url origin' in your local repo and pass the result. "
+            "Example: ensure_project(human_key='/your/path', git_remote_url='git@github.com:org/repo.git')",
+            recoverable=True,
+        )
+
+    # Gate: preserve existing behavior unless explicitly enabled
+    if not settings.worktrees_enabled:
+        return slugify(human_key)
+
+    # Mode: git-remote (server reads local git repo - only works for local deployments)
     if mode == "git-remote":
         try:
             # Attempt to use GitPython for robustness across worktrees
@@ -1272,9 +1304,15 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
         pass
     return payload
 
-async def _ensure_project(human_key: str) -> Project:
+async def _ensure_project(human_key: str, git_remote_url: Optional[str] = None) -> Project:
+    """
+    Ensure a project exists for the given human_key.
+
+    If git_remote_url is provided, slug is derived from the normalized remote URL,
+    enabling multiple developers on different machines to share the same project.
+    """
     await ensure_schema()
-    slug = _compute_project_slug(human_key)
+    slug = _compute_project_slug(human_key, git_remote_url=git_remote_url)
     async with get_session() as session:
         result = await session.execute(select(Project).where(Project.slug == slug))  # type: ignore[arg-type]
         project = result.scalars().first()
@@ -3038,7 +3076,12 @@ def build_mcp_server() -> FastMCP:
 
     @mcp.tool(name="ensure_project")
     @_instrument_tool("ensure_project", cluster=CLUSTER_SETUP, capabilities={"infrastructure", "storage"}, complexity="low", project_arg="human_key")
-    async def ensure_project(ctx: Context, human_key: str, identity_mode: Optional[str] = None) -> dict[str, Any]:
+    async def ensure_project(
+        ctx: Context,
+        human_key: str,
+        identity_mode: Optional[str] = None,
+        git_remote_url: Optional[str] = None,
+    ) -> dict[str, Any]:
         """
         Idempotently create or ensure a project exists for the given human key.
 
@@ -3063,6 +3106,16 @@ def build_mcp_server() -> FastMCP:
         - Sibling projects are DIFFERENT directories (e.g., /data/projects/smartedgar_mcp
           vs /data/projects/smartedgar_mcp_frontend)
 
+        Hosted Deployments (git_remote_url)
+        -----------------------------------
+        For hosted Agent Mail servers where multiple developers work on the same repo
+        from different machines, provide `git_remote_url` to derive the project slug
+        from the git remote instead of the local path. This ensures all developers
+        share the same project regardless of their local directory structure.
+
+        If the server is configured with PROJECT_IDENTITY_MODE=git-remote-required,
+        the `git_remote_url` parameter is mandatory.
+
         Parameters
         ----------
         human_key : str
@@ -3070,6 +3123,11 @@ def build_mcp_server() -> FastMCP:
             This MUST be an absolute path, not a relative path or arbitrary slug.
             This is the canonical identifier for the project - all agents working in this
             directory will share the same project identity.
+        git_remote_url : Optional[str]
+            The git remote URL for the project (e.g., "git@github.com:org/repo.git").
+            When provided, the project slug is derived from this URL instead of human_key,
+            enabling multiple developers to share the same project across different machines.
+            Run 'git remote get-url origin' to get this value.
 
         Returns
         -------
@@ -3078,7 +3136,7 @@ def build_mcp_server() -> FastMCP:
 
         Examples
         --------
-        JSON-RPC:
+        Local deployment (slug from path):
         ```json
         {
           "jsonrpc": "2.0",
@@ -3088,11 +3146,25 @@ def build_mcp_server() -> FastMCP:
         }
         ```
 
+        Hosted deployment (slug from git remote):
+        ```json
+        {
+          "jsonrpc": "2.0",
+          "id": "3",
+          "method": "tools/call",
+          "params": {"name": "ensure_project", "arguments": {
+            "human_key": "/data/projects/backend",
+            "git_remote_url": "git@github.com:myorg/backend.git"
+          }}
+        }
+        ```
+
         Common mistakes
         ---------------
         - Passing a relative path (e.g., "./backend") instead of an absolute path
         - Using arbitrary slugs instead of the actual working directory path
         - Creating separate projects for the same directory with different slugs
+        - On hosted servers: forgetting to provide git_remote_url
 
         Idempotency
         -----------
@@ -3101,19 +3173,27 @@ def build_mcp_server() -> FastMCP:
         """
         # Validate that human_key is an absolute path (cross-platform)
         if not Path(human_key).is_absolute():
-            raise ValueError(
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
                 f"human_key must be an absolute directory path, got: '{human_key}'. "
                 "Use the agent's working directory path (e.g., '/data/projects/backend' on Unix "
-                "or 'C:\\projects\\backend' on Windows)."
+                "or 'C:\\projects\\backend' on Windows).",
+                recoverable=True,
             )
 
-        await _ctx_info_safe(ctx, f"Ensuring project for key '{human_key}'.")
-        project = await _ensure_project(human_key)
+        # Normalize empty string to None
+        remote_url = git_remote_url.strip() if git_remote_url else None
+
+        await _ctx_info_safe(ctx, f"Ensuring project for key '{human_key}'" + (f" with remote '{remote_url}'" if remote_url else "") + ".")
+        project = await _ensure_project(human_key, git_remote_url=remote_url)
         await ensure_archive(settings, project.slug)
         # Compose identity metadata similar to resource://identity
         ident = _resolve_project_identity(human_key)
         payload = _project_to_dict(project)
         payload.update(ident)
+        # Include git_remote_url in response if provided
+        if remote_url:
+            payload["git_remote_url"] = remote_url
         return payload
 
     @mcp.tool(name="register_agent")
@@ -3126,6 +3206,7 @@ def build_mcp_server() -> FastMCP:
         name: Optional[str] = None,
         task_description: str = "",
         attachments_policy: str = "auto",
+        git_remote_url: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Create or update an agent identity within a project and persist its profile to Git.
@@ -3165,6 +3246,11 @@ def build_mcp_server() -> FastMCP:
             Names are unique per project; passing the same name updates the profile.
         task_description : str
             Short description of current focus (shows up in directory listings).
+        git_remote_url : Optional[str]
+            The git remote URL for the project (e.g., "git@github.com:org/repo.git").
+            When provided, the project is looked up or created using the slug derived
+            from this URL. Required when PROJECT_IDENTITY_MODE=git-remote-required.
+            Run 'git remote get-url origin' to get this value.
 
         Returns
         -------
@@ -3187,14 +3273,39 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
 
+        Hosted deployment with git_remote_url:
+        ```json
+        {"jsonrpc":"2.0","id":"5","method":"tools/call","params":{"name":"register_agent","arguments":{
+          "project_key":"/data/projects/backend","program":"claude-code","model":"opus-4.1",
+          "git_remote_url":"git@github.com:myorg/backend.git","task_description":"API work"
+        }}}
+        ```
+
         Pitfalls
         --------
         - Names MUST match the adjective+noun format or an error will be raised
         - Names are case-insensitive unique. If you see "already in use", pick another or omit `name`.
         - Use the same `project_key` consistently across cooperating agents.
+        - On hosted servers: provide git_remote_url to ensure correct project identity.
         """
         _validate_program_model(program, model)
-        project = await _get_project_by_identifier(project_key)
+        # Normalize git_remote_url
+        remote_url = git_remote_url.strip() if git_remote_url else None
+        # Check if git-remote-required mode and git_remote_url not provided
+        mode = (settings.project_identity_mode or "dir").strip().lower()
+        if mode == "git-remote-required" and not remote_url:
+            raise ToolExecutionError(
+                "MISSING_REQUIRED_PARAMETER",
+                "This Agent Mail server is configured with PROJECT_IDENTITY_MODE=git-remote-required. "
+                "You must provide the git_remote_url parameter. "
+                "Run 'git remote get-url origin' in your local repo and pass the result.",
+                recoverable=True,
+            )
+        # If git_remote_url provided, ensure project with correct slug first
+        if remote_url:
+            project = await _ensure_project(project_key, git_remote_url=remote_url)
+        else:
+            project = await _get_project_by_identifier(project_key)
         if settings.tools_log_enabled:
             try:
                 import importlib as _imp
@@ -5005,14 +5116,35 @@ def build_mcp_server() -> FastMCP:
         file_reservation_reason: str = "macro-session",
         file_reservation_ttl_seconds: int = 3600,
         inbox_limit: int = 10,
+        git_remote_url: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Macro helper that boots a project session: ensure project, register agent,
         optionally file_reservation paths, and fetch the latest inbox snapshot.
+
+        Parameters
+        ----------
+        git_remote_url : Optional[str]
+            The git remote URL for the project (e.g., "git@github.com:org/repo.git").
+            When provided, the project slug is derived from this URL instead of human_key,
+            enabling multiple developers to share the same project across different machines.
+            Required when PROJECT_IDENTITY_MODE=git-remote-required.
         """
         _validate_program_model(program, model)
         settings = get_settings()
-        project = await _ensure_project(human_key)
+        # Normalize git_remote_url
+        remote_url = git_remote_url.strip() if git_remote_url else None
+        # Check if git-remote-required mode and git_remote_url not provided
+        mode = (settings.project_identity_mode or "dir").strip().lower()
+        if mode == "git-remote-required" and not remote_url:
+            raise ToolExecutionError(
+                "MISSING_REQUIRED_PARAMETER",
+                "This Agent Mail server is configured with PROJECT_IDENTITY_MODE=git-remote-required. "
+                "You must provide the git_remote_url parameter. "
+                "Run 'git remote get-url origin' in your local repo and pass the result.",
+                recoverable=True,
+            )
+        project = await _ensure_project(human_key, git_remote_url=remote_url)
         agent = await _get_or_create_agent(project, agent_name, program, model, task_description, settings)
 
         file_reservations_result: Optional[dict[str, Any]] = None
