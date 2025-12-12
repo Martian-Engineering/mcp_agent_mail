@@ -610,6 +610,9 @@ async def write_message_bundle(
     timestamp_obj: Any = message.get("created") or message.get("created_ts")
     timestamp_str = timestamp_obj if isinstance(timestamp_obj, str) else datetime.now(timezone.utc).isoformat()
     now = datetime.fromisoformat(timestamp_str)
+    # Ensure timezone-aware for astimezone() call (naive datetimes assumed UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     y_dir = now.strftime("%Y")
     m_dir = now.strftime("%m")
 
