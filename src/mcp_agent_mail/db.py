@@ -106,16 +106,23 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
             return str(val.isoformat())
 
         def convert_datetime(val: bytes | str) -> dt_module.datetime | None:
-            """Convert ISO 8601 datetime to datetime.datetime object.
+            """Convert ISO 8601 datetime to timezone-aware datetime.datetime object.
 
             Returns None for any conversion errors (invalid format, wrong type,
             corrupted data, etc.) to allow graceful degradation rather than crashing.
+
+            Always returns a timezone-aware datetime (UTC) to prevent
+            "can't subtract offset-naive and offset-aware datetimes" errors.
             """
             try:
                 # Handle both bytes and str (SQLite can return either)
                 if isinstance(val, bytes):
                     val = val.decode('utf-8')
-                return dt_module.datetime.fromisoformat(val)
+                dt = dt_module.datetime.fromisoformat(val)
+                # Ensure the datetime is timezone-aware (assume UTC for naive datetimes)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=dt_module.timezone.utc)
+                return dt
             except (ValueError, AttributeError, TypeError, UnicodeDecodeError, OverflowError):
                 # Return None for any conversion failure:
                 # - ValueError: invalid ISO format string
